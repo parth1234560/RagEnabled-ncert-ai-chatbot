@@ -1,250 +1,178 @@
+# app_online_only_gemini.py
+# Fully Online RAG Chatbot: PDFs + FAISS + Gemini (1–12 students)
 
-# app.py
-# Chat with Multiple PDFs from a Directory (FAISS + Gemini via LangChain)
-
-import os
-import base64
+import os, re, requests
 from datetime import datetime
-from langchain.globals import set_llm_cache
-from langchain.cache import SQLiteCache
-import json
-
 import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader
+import google.generativeai as genai
 
-# LangChain / Google GenAI
+# LangChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-
-# Enable persistent caching
-set_llm_cache(SQLiteCache(database_path=".langchain_cache.db"))
-
-CACHE_FILE = "qa_cache.json"
-if os.path.exists(CACHE_FILE):
-    with open(CACHE_FILE, "r") as f:
-        qa_cache = json.load(f)
-else:
-    qa_cache = {}
 
 # -----------------------------
-# Helpers: PDF loading & text
+# PDF / text utilities
 # -----------------------------
-def save_cache():
-    with open(CACHE_FILE, "w") as f:
-        json.dump(qa_cache, f)
-
-def cached_query(query: str, chain, retriever):
-    """Return cached answer if available, else run chain and save to cache."""
-    if query in qa_cache:
-        return qa_cache[query]
-
-    docs = retriever.get_relevant_documents(query)
-    response = chain(
-        {"input_documents": docs, "question": query},
-        return_only_outputs=True
-    )
-    answer = response["output_text"]
-
-    qa_cache[query] = answer
-    save_cache()
-    return answer
+def clean_text(text: str):
+    if not text:
+        return ""
+    text = text.lower().replace("\n", " ").replace("\r", " ").strip()
+    text = " ".join(text.split())
+    text = re.sub(r"\d+_prelims\.indd", "", text)
+    text = re.sub(r"\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2} (am|pm)", "", text)
+    text = re.sub(r"chapter \d+\.indd", "", text)
+    text = text.replace("’", "'").replace("“", '"').replace("”", '"')
+    return text
 
 def load_pdfs_from_directory(directory_path: str):
-    """Return absolute paths of all .pdf files inside the directory (non-recursive)."""
     if not directory_path or not os.path.isdir(directory_path):
         return []
-    pdf_paths = []
-    for fname in os.listdir(directory_path):
-        if fname.lower().endswith(".pdf"):
-            pdf_paths.append(os.path.join(directory_path, fname))
-    return sorted(pdf_paths)
+    return sorted([os.path.join(directory_path, f) for f in os.listdir(directory_path) if f.lower().endswith(".pdf")])
 
 def extract_text_from_pdfs(pdf_paths):
-    """Read all PDFs and return a single concatenated string of text."""
     all_text = []
     for path in pdf_paths:
         try:
             with open(path, "rb") as f:
                 reader = PdfReader(f)
                 for page in reader.pages:
-                    txt = page.extract_text() or ""
-                    all_text.append(txt)
+                    text = page.extract_text()
+                    if text:
+                        cleaned = clean_text(text)
+                        if cleaned:
+                            all_text.append({"content": cleaned, "source": os.path.basename(path)})
         except Exception as e:
             st.warning(f"Could not read '{os.path.basename(path)}': {e}")
-    return "\n".join(all_text)
+    return all_text
 
-def chunk_text(text: str):
-    """Split text into overlapping chunks for RAG."""
+def chunk_text_with_source(text_with_source, chunk_size=500, chunk_overlap=50):
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", " ", ".", "?", "!", ","],
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ".", "?", "!", ","]
     )
-    return splitter.split_text(text)
+    chunks = []
+    for item in text_with_source:
+        text_chunks = splitter.split_text(item["content"])
+        for c in text_chunks:
+            chunks.append({"content": c, "source": item["source"]})
+    return chunks
 
 # -----------------------------
-# Vector store (FAISS)
+# FAISS vector store
 # -----------------------------
-def build_faiss_index_from_folder(folder_path: str, api_key: str, index_dir: str = "faiss_index"):
-    """Create embeddings for all text chunks from PDFs in folder and save FAISS locally."""
-    pdf_paths = load_pdfs_from_directory(folder_path)
-    if not pdf_paths:
-        raise ValueError("No PDFs found in the given folder.")
-
-    raw_text = extract_text_from_pdfs(pdf_paths)
-    if not raw_text.strip():
+def build_faiss_index(folder_path, index_dir):
+    pdf_data = extract_text_from_pdfs(load_pdfs_from_directory(folder_path))
+    if not pdf_data:
         raise ValueError("No extractable text found in PDFs.")
 
-    chunks = chunk_text(raw_text)
+    chunks = chunk_text_with_source(pdf_data)
+    from langchain.embeddings import HuggingFaceEmbeddings
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key
+    vs = FAISS.from_texts(
+        [c["content"] for c in chunks],
+        embedding=embeddings,
+        metadatas=[{"source": c["source"]} for c in chunks]
     )
-    vs = FAISS.from_texts(chunks, embedding=embeddings)
     vs.save_local(index_dir)
     return vs
 
-def load_faiss_index(api_key: str, index_dir: str = "faiss_index"):
-    """Load existing FAISS index if available."""
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key
-    )
+def load_faiss_index(index_dir):
+    from langchain.embeddings import HuggingFaceEmbeddings
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     return FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
 
-# -----------------------------
-# QA Chain
-# -----------------------------
-def make_qa_chain(api_key: str):
-    prompt_template = """
-You are a kind and patient teacher for students in classes 1–12, especially from rural areas.  
-Always use **simple words** and **easy examples**.  
+@st.cache_data(show_spinner=False)
+def get_faiss_index(folder_path, index_dir):
+    if os.path.exists(index_dir) and os.listdir(index_dir):
+        return load_faiss_index(index_dir)
+    return build_faiss_index(folder_path, index_dir)
 
-Rules for answering:
-1. Use ONLY the information from the given context.  
-2. If the answer is not in the context, say:  
-   "answer is not available in the context".  
-3. Always explain in **short steps or bullet points**.  
-4. Give a **small example** if it helps.  
-5. At the end, ask the student a follow-up question to keep them curious.  
+# -----------------------------
+# Internet check
+# -----------------------------
+def is_online():
+    try:
+        requests.get("https://www.google.com", timeout=3)
+        return True
+    except:
+        return False
 
-Context:
+# -----------------------------
+# Online QA using Gemini
+# -----------------------------
+def ask_question_online(query, retriever):
+    # Search PDFs first
+    docs = retriever.get_relevant_documents(query)
+    context = " ".join([f"{d.page_content} (from {d.metadata.get('source','unknown')})" for d in docs])
+
+    # Prompt: Use PDF content if available, else search online for educational content only
+    prompt_text = f"""
+You are a kind and patient teacher for students from grade 1 to 12 (rural-friendly). 
+By default answer the student's question in simple, easy-to-understand language, using short bullet points and examples wherever possible. 
+
+Instructions:
+1. Use the context provided from the PDFs to answer the question.
+2. If the answer is not found in the PDF context:
+   a) Clearly indicate that the content was not found in the NCERT book.
+   b) Fetch the answer from educational resources online suitable for school students.
+   c) Begin your answer with a note like: "Note: This answer was fetched online as it was not found in the NCERT book."
+3. Only provide educational content appropriate for school students. 
+4. If the question is not educational or the content cannot be found online also, respond: "Sorry, I don't know."
+
+Context from PDFs:
 {context}
 
-Student’s Question:
-{question}
+Student Question:
+{query}
 
-Teacher’s Answer:
+Teacher Answer:
 """
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0.3,
-        google_api_key=api_key
-    )
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"],
-    )
-    chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
-    return chain
+    genai.configure(api_key="AIzaSyB223m5jS1-WlHv6zz1nT491eD4yaMl5Yg")  # <-- Replace with your key
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    response = model.generate_content(prompt_text)
+    return {"answer": response.text, "model_used": "Gemini"}
 
 # -----------------------------
-# UI: Streamlit App
+# Streamlit UI
 # -----------------------------
 def main():
-    st.set_page_config(page_title="Chat with PDFs (Folder)", page_icon="📚")
-    st.title("📚 RAG + Cached AI Bot for NCERT Books")
+    st.set_page_config(page_title="NCERT Online Tutor", page_icon="📚")
+    st.title("📚 NCERT Online Tutor: PDFs + Gemini + FAISS")
 
-    # session state
-    if "conversation_history" not in st.session_state:
-        st.session_state.conversation_history = []
-    if "index_ready" not in st.session_state:
-        st.session_state.index_ready = False
-
-    st.sidebar.header("Settings")
-
-    api_key = os.getenv("GOOGLE_API_KEY")
+    st.session_state.setdefault("conversation_history", [])
 
     folder_path = r"C:\Users\PARTH\Downloads\hecu1dd"
-    index_dir = st.sidebar.text_input("FAISS Index Directory", value="faiss_index")
+    index_dir = r"C:\Users\PARTH\OneDrive\Desktop\sih\RAG-PDF-CHATBOT\faiss_index"
 
-    colA, colB = st.sidebar.columns(2)
-    build_btn = colA.button("🔨 Build / Rebuild Index")
-    reset_btn = colB.button("♻️ Reset History")
+    db = get_faiss_index(folder_path, index_dir)
 
-    if reset_btn:
-        st.session_state.conversation_history = []
+    st.sidebar.header("Settings")
+    if st.sidebar.button("♻️ Reset History"):
+        st.session_state.conversation_history.clear()
         st.success("Conversation history cleared.")
 
-    # Build or rebuild the index
-    if build_btn:
-        if not api_key:
-            st.warning("Please enter your Google API Key.")
-        elif not folder_path.strip():
-            st.warning("Please enter a valid folder path.")
-        else:
-            with st.spinner("Building FAISS index from your folder (this may take a moment)..."):
-                try:
-                    build_faiss_index_from_folder(folder_path, api_key, index_dir=index_dir)
-                    st.session_state.index_ready = True
-                    st.success("FAISS index built and saved successfully!")
-                except Exception as e:
-                    st.session_state.index_ready = False
-                    st.error(f"Failed to build index: {e}")
-
-    # Try to load an existing index if not flagged ready yet
-    if not st.session_state.index_ready and api_key:
-        try:
-            _ = load_faiss_index(api_key, index_dir=index_dir)
-            st.session_state.index_ready = True
-        except Exception:
-            pass  # no existing index yet
-
-    # Ask a question
-    st.subheader("Ask a question")
-    question = st.text_input("Type your question about the folder PDFs")
-
+    question = st.text_input("Type your question about NCERT PDFs or school topics")
     if question:
-        if not api_key:
-            st.warning("Please enter your Google API Key in the sidebar.")
-        elif not st.session_state.index_ready:
-            st.warning("Please build the index first (sidebar → Build / Rebuild Index).")
+        retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+        if is_online():
+            response = ask_question_online(question, retriever)
         else:
-            try:
-                embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/embedding-001",
-                    google_api_key=api_key
-                )
-                db = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
-                retriever = db.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 3}
-                )
-                chain = make_qa_chain(api_key)
+            st.warning("No internet connection. This app requires online access.")
+            return
 
-                # now we directly get final answer string
-                answer = cached_query(question, chain, retriever)
+        pdf_names = ", ".join([os.path.basename(p) for p in load_pdfs_from_directory(folder_path)])
+        st.session_state.conversation_history.append(
+            (question, response['answer'], response['model_used'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pdf_names)
+        )
 
-                # record history
-                pdf_names = ", ".join([os.path.basename(p) for p in load_pdfs_from_directory(folder_path)])
-                st.session_state.conversation_history.append(
-                    (question, answer, "Google AI", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pdf_names)
-                )
+        st.markdown(f"**You:** {question}")
+        st.markdown(f"**Bot ({response['model_used']}):** {response['answer']}")
 
-                # show chat turn
-                st.markdown(f"**You:** {question}")
-                st.markdown(f"**Bot:** {answer}")
-
-            except Exception as e:
-                st.error(f"Query failed: {e}")
-
-    # history + download
-    if len(st.session_state.conversation_history) > 0:
+    if st.session_state.conversation_history:
         st.divider()
         st.subheader("Conversation History")
         for q, a, model, ts, names in reversed(st.session_state.conversation_history):
@@ -252,18 +180,9 @@ def main():
                 st.write(a)
                 st.caption(f"Model: {model} | PDFs: {names}")
 
-        df = pd.DataFrame(
-            st.session_state.conversation_history,
-            columns=["Question", "Answer", "Model", "Timestamp", "PDF Name"]
-        )
-        csv = df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        st.download_button(
-            "Download History (CSV)",
-            data=csv,
-            file_name="conversation_history.csv",
-            mime="text/csv",
-        )
+        df = pd.DataFrame(st.session_state.conversation_history,
+                          columns=["Question", "Answer", "Model", "Timestamp", "PDF Name"])
+        st.download_button("Download History (CSV)", data=df.to_csv(index=False), file_name="conversation_history.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
