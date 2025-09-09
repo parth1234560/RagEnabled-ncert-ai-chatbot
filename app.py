@@ -6,7 +6,7 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader
-import google.generativeai as genai
+import google-generativeai as genai
 
 # LangChain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
